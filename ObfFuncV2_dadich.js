@@ -1,30 +1,22 @@
 /**
  * ============================================================================
- * TỆP: ObfFuncV2_dadich.js (Bản sửa lỗi kết nối QCaptcha & hoàn thiện Bypass PROMAX)
+ * TỆP: ObfFuncV2_dadich.js
  * TÊN GỐC: ObfFuncV2.js (Layma.net Bypass - CUTTAY PROMAX v1.1.1 / VNBYPASS)
  * TÁC GIẢ GỐC: DuckXKurumi
- * REVERSE ENGINEER & FIX: VANTA
+ * NGƯỜI DỊCH NGƯỢC & TỐI ƯU HÓA: VANTA
  * 
- * NGUYÊN NHÂN LỖI "KO KẾT NỐI ĐƯỢC CAPTCHA":
- *   1. Lỗi CORS & Thiếu Headers: Máy chủ QCaptcha (frame.103-141-140-153.sslip.io)
- *      yêu cầu bắt buộc phải có Origin: https://frame... và Referer: .../frame.html.
- *      Hàm fetch thông thường của trình duyệt chặn sửa các header này gây ra lỗi
- *      CORS hoặc bị máy chủ ngắt kết nối.
- *   2. Máy chủ từ chối Host: Máy chủ QCaptcha kiểm tra host gửi đến. Khi gửi trực tiếp
- *      từ layma.net, máy chủ trả về lỗi {"error":"hostname-not-allowed"}.
- * 
- * GIẢI PHÁP ĐÃ ÁP DỤNG TRONG BẢN NÀY:
- *   - Định tuyến toàn bộ kết nối QCaptcha qua GM_xmlhttpRequest của Tampermonkey
- *     để gửi đúng Origin & Referer chuẩn mà không bị CORS chặn.
- *   - Tự động phát hiện lỗi "hostname-not-allowed" để chuyển hướng sang chế độ
- *     Bypass trực tiếp (Direct Submission) không cần qua QCaptcha.
- *   - Bổ sung nút "Vượt nhanh không cần giải Captcha" ngay trên bảng điều khiển
- *     trung tâm của VNBYPASS, đảm bảo luôn hoàn thành nhiệm vụ 100%.
+ * BẢN CẬP NHẬT:
+ *   - Sửa triệt để lỗi "Không kết nối được QCaptcha" do gọi máy chủ proxy cũ bị chết.
+ *   - Hiển thị trực tiếp widget Captcha (hCaptcha) ra giao diện chính để người dùng tự tay giải.
+ *   - Không ẩn các phần tử Captcha gốc của trang (giữ .verify-fields, .h-captcha hiển thị rõ ràng).
+ *   - Tự động nhận diện SiteKey chính xác (facd4b6c-53e6-44a2-9b27-b01844a6bd75).
+ *   - Cơ chế lắng nghe tự động (Auto-detector): Khi người dùng giải xong Captcha, hệ thống
+ *     tự động phát hiện token và nộp mã lên máy chủ ngay lập tức.
  * ============================================================================
  */
 
 // ============================================================================
-// PHẦN 1: BỘ NẠP DỮ LIỆU ĐỘNG (LOADER)
+// PHẦN 1: BỘ NẠP DỮ LIỆU ĐỘNG (DYNAMIC LOADER)
 // ============================================================================
 (function initializeLoader() {
     'use strict';
@@ -35,20 +27,32 @@
             if (typeof unsafeWindow !== 'undefined') {
                 unsafeWindow.GM_xmlhttpRequest = GM_xmlhttpRequest;
             }
-        } catch (e) {}
+        } catch (e) {
+            console.warn('[VNBYPASS Loader] Không thể gắn GM_xmlhttpRequest vào unsafeWindow:', e);
+        }
     }
 
-    // Khởi chạy trực tiếp Engine nội bộ đã sửa lỗi kết nối
+    // Chạy Engine nội bộ đã được deobfuscate hoàn chỉnh
     runVnBypassCore(window, document);
 })();
 
+
 // ============================================================================
-// PHẦN 2: BỘ XỬ LÝ LÕI VNBYPASS PROMAX (CORE ENGINE)
+// PHẦN 2: BỘ XỬ LÝ LÕI VNBYPASS / CUTTAY PROMAX (DEOBFUSCATED CORE ENGINE)
 // ============================================================================
 function runVnBypassCore(window, document) {
     'use strict';
 
-    console.log('[VNBYPASS] Đang khởi chạy CUTTAY PROMAX Core v2 (Bản sửa lỗi Captcha)...');
+    console.log('[VNBYPASS] Đang khởi chạy hệ thống CUTTAY PROMAX Core v2...');
+
+    // ------------------------------------------------------------------------
+    // 1. CẤU HÌNH & QUẢN LÝ LOCAL STORAGE
+    // ------------------------------------------------------------------------
+    const CONFIG = {
+        DEFAULT_SITEKEY: 'facd4b6c-53e6-44a2-9b27-b01844a6bd75',
+        HCAPTCHA_SCRIPT_URL: 'https://js.hcaptcha.com/1/api.js?render=explicit',
+        BACKUP_HCAPTCHA_TOKEN: 'Krprba8mMnrRnL0fCU24uJDqRtZ07ohQ'
+    };
 
     const STORAGE_KEYS = {
         AUTO_CHANGE: 'vnbypass_auto_change',
@@ -60,26 +64,48 @@ function runVnBypassCore(window, document) {
         CUSTOM_BLACKLIST: 'vnbypass_custom_blacklist'
     };
 
-    const BACKUP_TOKEN = 'Krprba8mMnrRnL0fCU24uJDqRtZ07ohQ';
+    const Settings = {
+        get autoChange() { return localStorage.getItem(STORAGE_KEYS.AUTO_CHANGE) !== 'false'; },
+        get blacklistAutoChange() { return localStorage.getItem(STORAGE_KEYS.BLACKLIST_AUTO_CHANGE) !== 'false'; },
+        get autoOpenLink() { return localStorage.getItem(STORAGE_KEYS.AUTO_OPEN_LINK) === 'true'; },
+        get waitTime() { return parseInt(localStorage.getItem(STORAGE_KEYS.WAIT_TIME), 10) || 60; }
+    };
 
-    /**
-     * Dọn dẹp DOM trang layma.net
-     */
+    let globalState = {
+        hCaptchaWidgetId: null,
+        captchaWatcherInterval: null,
+        isSubmitting: false,
+        sessionToken: null
+    };
+
+    // ------------------------------------------------------------------------
+    // 2. DỌN DẸP GIAO DIỆN TRANG WEB GỐC (DOM CLEANER)
+    // ------------------------------------------------------------------------
     function injectCleanerStyles() {
         if (document.getElementById('vnbypass-clean-style')) return;
 
         const style = document.createElement('style');
         style.id = 'vnbypass-clean-style';
         style.textContent = `
+            /* Ẩn các banner quảng cáo, video và nút giả rác */
             .heading, .box-step-note, .box-step-link, .box-step-title, .box-copy, .box-google,
-            .box-step-getCode, .box-video, #videohd, #xuong, .box-linkFB-wrap, .box-btn-copy,
+            .box-video, #videohd, #xuong, .box-linkFB-wrap, .box-btn-copy,
             .box-google-note, #btn-xac-nhan, #btn-baoloi, .box-step-footer, .box-footer, footer,
-            .intro, .progress, .warning, aside.warning, section.step, .step, .step-body, .verify-fields,
+            .intro, .progress, .warning, aside.warning,
             .videos, .video-grid, .video-item, .responsive-video, .code-image, .search-mock,
             #copyMessage, .browser-link, .decoration {
                 display: none !important;
             }
 
+            /* ĐẢM BẢO KHUNG CHỨA CAPTCHA VÀ FORM NHẬP MÃ CỦA TRANG KHÔNG BỊ ẨN */
+            .verify-fields, .box-step-getCode, .h-captcha, [data-sitekey],
+            #captcha-native-target, #captcha2-native-target, #hcaptcha-target {
+                display: block !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+            }
+
+            /* Khung điều khiển trung tâm VNBYPASS */
             #vnbypass-wrapper {
                 display: flex !important;
                 width: 100% !important;
@@ -103,17 +129,33 @@ function runVnBypassCore(window, document) {
             }
             .btn-primary { background: #2563eb; color: #fff; }
             .btn-primary:hover { background: #1d4ed8; }
-            .btn-bypass {
-                background: linear-gradient(135deg, #10b981, #059669);
-                color: #fff; box-shadow: 0 4px 12px rgba(16,185,129,0.3);
-            }
-            .btn-bypass:hover { filter: brightness(1.08); }
+            .btn-success { background: #16a34a; color: #fff; }
+            .btn-success:hover { background: #15803d; }
             .btn-danger { background: #dc2626; color: #fff; }
             .btn-danger:hover { background: #b91c1c; }
+            .btn-warning { background: #f59e0b; color: #fff; }
+            .btn-warning:hover { background: #d97706; }
+
+            /* Khung hiển thị Captcha rõ ràng */
+            #vnbypass-captcha-container {
+                min-height: 82px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                background: #f8fafc;
+                border: 2px dashed #cbd5e1;
+                border-radius: 12px;
+                padding: 16px;
+                margin-top: 14px;
+            }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
 
+    // ------------------------------------------------------------------------
+    // 3. TIỆN ÍCH BÓC TÁCH DỮ LIỆU TỪ TRANG
+    // ------------------------------------------------------------------------
     function getTokenId() {
         const el = document.getElementById('tokenId');
         return el ? String(el.textContent).trim() : '';
@@ -143,78 +185,82 @@ function runVnBypassCore(window, document) {
         return '';
     }
 
-    /**
-     * Kênh giao tiếp mạng an toàn qua GM_xmlhttpRequest (Bypass CORS & Custom Headers)
-     */
-    function sendSecureNetworkRequest(opts) {
-        return new Promise((resolve, reject) => {
-            const gmReq = window.GM_xmlhttpRequest 
-                || (typeof GM_xmlhttpRequest !== 'undefined' ? GM_xmlhttpRequest : null)
-                || (window.unsafeWindow && window.unsafeWindow.GM_xmlhttpRequest);
+    function detectSiteKey() {
+        const html = document.body ? document.body.innerHTML : '';
+        const patterns = [
+            /hCaptchaSiteKey\s*=\s*['"]([^'"]+)['"]/i,
+            /data-sitekey\s*=\s*['"]([^'"]+)['"]/i,
+            /qCaptchaSiteKey\s*=\s*['"]([^'"]+)['"]/i,
+            /(?:captcha|sitekey)\b[^"']*?['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/i
+        ];
 
-            if (gmReq) {
-                gmReq({
-                    method: opts.method || 'GET',
-                    url: opts.url,
-                    headers: opts.headers || {},
-                    data: opts.data || null,
-                    timeout: opts.timeout || 15000,
-                    onload: (res) => {
-                        try {
-                            const json = JSON.parse(res.responseText);
-                            resolve(json);
-                        } catch (e) {
-                            resolve(res.responseText);
-                        }
-                    },
-                    onerror: () => reject(new Error('Lỗi kết nối mạng qua Tampermonkey')),
-                    ontimeout: () => reject(new Error('Hết thời gian chờ phản hồi (Timeout)'))
-                });
+        for (const pattern of patterns) {
+            const m = html.match(pattern);
+            if (m && m[1]) return m[1];
+        }
+
+        const sitekeyElem = document.querySelector('[data-sitekey]');
+        if (sitekeyElem) {
+            const val = sitekeyElem.getAttribute('data-sitekey');
+            if (val) return val;
+        }
+
+        return CONFIG.DEFAULT_SITEKEY;
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. API GIAO TIẾP VỚI MÁY CHỦ LAYMA (NETWORK LAYER)
+    // ------------------------------------------------------------------------
+    function requestTrafficSession(keyToken) {
+        return new Promise((resolve, reject) => {
+            const reqFunc = window.GM_xmlhttpRequest || (typeof GM_xmlhttpRequest !== 'undefined' ? GM_xmlhttpRequest : null);
+            if (!reqFunc) {
+                fetch('/api/traffic/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keyToken: keyToken })
+                })
+                .then(res => res.json())
+                .then(data => resolve(data.sessionToken || data.SessionToken))
+                .catch(reject);
                 return;
             }
 
-            // Fallback fetch thông thường
-            fetch(opts.url, {
-                method: opts.method || 'GET',
-                headers: opts.headers || {},
-                body: opts.data || undefined
-            })
-            .then(res => res.json().catch(() => res.text()))
-            .then(resolve)
-            .catch(reject);
-        });
-    }
-
-    /**
-     * Khởi tạo Traffic Session Token
-     */
-    async function requestTrafficSession(keyToken) {
-        try {
-            const res = await sendSecureNetworkRequest({
+            reqFunc({
                 method: 'POST',
                 url: '/api/traffic/session',
                 headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify({ keyToken: keyToken })
+                data: JSON.stringify({ keyToken: keyToken }),
+                timeout: 10000,
+                onload: (res) => {
+                    if (res.status >= 200 && res.status < 300) {
+                        try {
+                            const json = JSON.parse(res.responseText);
+                            const token = json.sessionToken || json.SessionToken;
+                            if (token) {
+                                sessionStorage.setItem('sessionToken', token);
+                                resolve(token);
+                            } else {
+                                reject(new Error('Phản hồi không chứa sessionToken'));
+                            }
+                        } catch (e) {
+                            reject(new Error('Lỗi giải mã JSON từ /api/traffic/session'));
+                        }
+                    } else {
+                        reject(new Error(`POST /api/traffic/session thất bại (HTTP ${res.status})`));
+                    }
+                },
+                onerror: () => reject(new Error('Lỗi kết nối /api/traffic/session')),
+                ontimeout: () => reject(new Error('POST /api/traffic/session timeout'))
             });
-
-            const token = res.sessionToken || res.SessionToken;
-            if (token) {
-                sessionStorage.setItem('sessionToken', token);
-                return token;
-            }
-        } catch (e) {
-            console.warn('[LAYMA] Lỗi lấy sessionToken:', e.message);
-        }
-        return '';
+        });
     }
 
-    /**
-     * Tự động đổi nhiệm vụ
-     */
     async function executeChangeMission(sessionToken) {
+        console.warn('[AUTO-CHANGE] Đang tự động đổi nhiệm vụ...');
         const tokenId = getTokenId();
         if (!tokenId) {
-            alert('Không tìm thấy Token ID trên trang hiện tại!');
+            console.error('[AUTO-CHANGE] Không tìm thấy Token ID trên trang hiện tại!');
             return;
         }
 
@@ -229,315 +275,82 @@ function runVnBypassCore(window, document) {
             });
 
             if (res.ok) {
+                console.log('[AUTO-CHANGE] Đổi nhiệm vụ thành công. Đang tải lại trang...');
                 window.location.reload();
             } else {
-                alert('Lỗi đổi nhiệm vụ: ' + (await res.text()));
+                const text = await res.text();
+                alert('Lỗi đổi nhiệm vụ: ' + text);
             }
         } catch (e) {
-            alert('Không thể kết nối máy chủ đổi nhiệm vụ!');
+            alert('Không thể kết nối đến máy chủ đổi nhiệm vụ!');
         }
     }
 
-    /**
-     * Module mật mã học WebCrypto cho QCaptcha
-     */
-    class QCryptoEngine {
-        static async generateClientKeyPair() {
-            if (!window.crypto || !window.crypto.subtle) {
-                throw new Error('Trình duyệt không hỗ trợ WebCrypto');
-            }
-            return await window.crypto.subtle.generateKey(
-                { name: 'ECDH', namedCurve: 'P-256' },
-                true,
-                ['deriveBits']
-            );
-        }
-
-        static async solvePoW(challengeBase, targetBits) {
-            const startTime = performance.now();
-            let nonce = 0;
-            const enc = new TextEncoder();
-
-            while (true) {
-                const data = enc.encode(challengeBase + ':' + nonce);
-                const hashBuf = await window.crypto.subtle.digest('SHA-256', data);
-                const hashArr = new Uint8Array(hashBuf);
-
-                let leadingZeros = 0;
-                for (let i = 0; i < hashArr.length; i++) {
-                    const byteVal = hashArr[i];
-                    if (byteVal === 0) {
-                        leadingZeros += 8;
-                    } else {
-                        leadingZeros += Math.clz32(byteVal) - 24;
-                        break;
-                    }
+    // ------------------------------------------------------------------------
+    // 5. THU THẬP FINGERPRINT VÀ NỘP MÃ (CHECKCODE SUBMITTER)
+    // ------------------------------------------------------------------------
+    async function collectDeviceFingerprint() {
+        let battery = null;
+        try {
+            if (navigator.getBattery) {
+                const b = await Promise.race([
+                    navigator.getBattery(),
+                    new Promise(r => setTimeout(() => r(null), 1200))
+                ]);
+                if (b) {
+                    battery = {
+                        level: typeof b.level === 'number' ? Math.round(b.level * 100) : null,
+                        charging: typeof b.charging === 'boolean' ? b.charging : null,
+                        chargingTime: Number.isFinite(b.chargingTime) ? b.chargingTime : null,
+                        dischargingTime: Number.isFinite(b.dischargingTime) ? b.dischargingTime : null
+                    };
                 }
-
-                if (leadingZeros >= targetBits) {
-                    return { nonce, elapsedMs: Math.round(performance.now() - startTime) };
-                }
-                nonce++;
-                if (nonce > 1500000) break;
             }
-            return { nonce, elapsedMs: Math.round(performance.now() - startTime) };
-        }
+        } catch (e) {}
+
+        const orientation = ('DeviceOrientationEvent' in window)
+            ? { supported: true, granted: true, available: false }
+            : { supported: false };
+
+        return JSON.stringify({
+            version: 'v1',
+            language: navigator.language || 'vi-VN',
+            platform: navigator.platform || 'Linux aarch64',
+            browser: 'Chrome',
+            browserVersion: '151.0.0.0',
+            screen: `${window.screen.width || 1920} x ${window.screen.height || 1080}`,
+            colorDepth: (window.screen && window.screen.colorDepth) || 24,
+            pixelRatio: window.devicePixelRatio || 1,
+            battery: battery,
+            orientation: orientation,
+            createdAt: new Date().toISOString()
+        });
     }
 
     /**
-     * Bộ điều khiển QCaptcha với cơ chế tự phục hồi lỗi kết nối
+     * Nộp mã và token xác thực đến backend
      */
-    class QCaptchaController {
-        constructor(mountContainer, siteKey, serverUrl) {
-            this.container = mountContainer;
-            this.siteKey = siteKey || 'facd4b6c-53e6-44a2-9b27-b01844a6bd75';
-            this.serverUrl = serverUrl || 'https://frame.103-141-140-153.sslip.io';
-            this.selectedIndices = new Set();
-            this.sessionData = null;
+    async function submitCodeVerification(token, campaignId, code, captchaToken, sessionToken) {
+        if (globalState.isSubmitting) return;
+        globalState.isSubmitting = true;
+
+        const statusElem = document.getElementById('vnbypass-status');
+        if (statusElem) {
+            statusElem.style.color = '#0284c7';
+            statusElem.innerHTML = '🚀 Đang nộp mã xác thực lên máy chủ...';
         }
 
-        async init() {
-            this.renderLoading('Đang kết nối QCaptcha...', 'Đang khởi tạo kênh bảo mật qua Tampermonkey');
+        const fingerprintData = await collectDeviceFingerprint();
 
-            try {
-                this.keyPair = await QCryptoEngine.generateClientKeyPair();
-                const clientPubRaw = await window.crypto.subtle.exportKey('raw', this.keyPair.publicKey);
-
-                // Chuẩn hóa origin và referer
-                let origin = 'https://frame.103-141-140-153.sslip.io';
-                try {
-                    const u = new URL(this.serverUrl);
-                    let host = u.hostname.replace(/^js\./, 'frame.');
-                    origin = 'https://' + host + (u.port ? ':' + u.port : '');
-                } catch (e) {}
-
-                // Gửi request qua GM_xmlhttpRequest để bypass CORS
-                const initData = await sendSecureNetworkRequest({
-                    method: 'POST',
-                    url: `${origin}/v1/init`,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json',
-                        'Origin': origin,
-                        'Referer': `${origin}/frame.html`
-                    },
-                    data: JSON.stringify({
-                        sitekey: this.siteKey,
-                        host: window.location.hostname,
-                        pubkey: Array.from(new Uint8Array(clientPubRaw))
-                    })
-                });
-
-                // Nếu máy chủ từ chối host hoặc lỗi
-                if (initData && initData.error) {
-                    throw new Error(`Máy chủ QCaptcha phản hồi: ${initData.error}`);
-                }
-
-                this.sessionData = initData;
-
-                if (initData.challenge && initData.challenge.spec) {
-                    this.renderChallenge(initData.challenge);
-                } else if (initData.pass && initData.token) {
-                    this.renderSuccess(initData.token);
-                } else {
-                    throw new Error('Dữ liệu QCaptcha không hợp lệ');
-                }
-            } catch (err) {
-                console.warn('[VNBYPASS] Không kết nối được QCaptcha:', err.message);
-                this.renderError(err.message || 'Lỗi kết nối máy chủ');
-            }
-        }
-
-        renderLoading(title, sub) {
-            this.container.innerHTML = `
-                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
-                    <div style="font-size:14px;font-weight:700;color:#2563eb;margin-bottom:4px;">${title}</div>
-                    <div style="font-size:12px;color:#64748b;">${sub}</div>
-                </div>
-            `;
-        }
-
-        renderChallenge(challenge) {
-            const spec = challenge.spec;
-            const cols = spec.cols || 3;
-            const isSingle = spec.single === true;
-
-            let tilesHtml = '';
-            spec.assets.forEach((imgUrl, idx) => {
-                tilesHtml += `
-                    <button type='button' class='qcw-tile' data-idx='${idx}' style="position:relative;aspect-ratio:1/1;padding:0;border:2px solid #e5e9f2;border-radius:10px;overflow:hidden;cursor:pointer;">
-                        <img src='${imgUrl}' style="width:100%;height:100%;object-fit:cover;">
-                        <span class='qcw-check' style="position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:50%;background:#4f46e5;color:#fff;display:none;align-items:center;justify-content:center;font-size:11px;">✓</span>
-                    </button>
-                `;
-            });
-
-            this.container.innerHTML = `
-                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,0.08);max-width:360px;margin:0 auto;">
-                    <div style="background:#eef2ff;border-left:3px solid #6366f1;color:#312e81;padding:8px 12px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:10px;">
-                        ${spec.question || 'Chọn các hình phù hợp'}
-                    </div>
-                    <div style="display:grid;grid-template-columns:repeat(${cols}, 1fr);gap:6px;margin-bottom:10px;">
-                        ${tilesHtml}
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button type="button" id="qcw-submit" class="btn btn-primary" style="flex:1;">Xác nhận</button>
-                        <button type="button" id="qcw-skip" class="btn" style="background:#f1f5f9;color:#475569;">Đổi câu</button>
-                    </div>
-                    <button type="button" id="qcw-bypass-direct" class="btn btn-bypass" style="width:100%;margin-top:8px;">
-                        ⚡ Bỏ qua Captcha & Nhận Mã Ngay
-                    </button>
-                    <div id="qcw-status" style="font-size:12px;margin-top:8px;text-align:center;"></div>
-                </div>
-            `;
-
-            const tiles = this.container.querySelectorAll('.qcw-tile');
-            tiles.forEach(tile => {
-                tile.onclick = () => {
-                    const idx = parseInt(tile.getAttribute('data-idx'), 10);
-                    const check = tile.querySelector('.qcw-check');
-                    if (isSingle) {
-                        tiles.forEach(t => {
-                            t.style.borderColor = '#e5e9f2';
-                            t.querySelector('.qcw-check').style.display = 'none';
-                        });
-                        this.selectedIndices.clear();
-                        this.selectedIndices.add(idx);
-                        tile.style.borderColor = '#4f46e5';
-                        check.style.display = 'flex';
-                    } else {
-                        if (this.selectedIndices.has(idx)) {
-                            this.selectedIndices.delete(idx);
-                            tile.style.borderColor = '#e5e9f2';
-                            check.style.display = 'none';
-                        } else {
-                            this.selectedIndices.add(idx);
-                            tile.style.borderColor = '#4f46e5';
-                            check.style.display = 'flex';
-                        }
-                    }
-                };
-            });
-
-            this.container.querySelector('#qcw-skip').onclick = () => this.init();
-
-            this.container.querySelector('#qcw-bypass-direct').onclick = () => {
-                if (typeof this.onSuccess === 'function') {
-                    this.onSuccess(BACKUP_TOKEN);
-                }
-            };
-
-            this.container.querySelector('#qcw-submit').onclick = async () => {
-                const statusBox = this.container.querySelector('#qcw-status');
-                statusBox.innerHTML = '<span style="color:#2563eb;">Đang xác minh đáp án...</span>';
-
-                try {
-                    let powNonce = 0;
-                    let solveMs = 0;
-                    if (this.sessionData.challenge && this.sessionData.challenge.pow) {
-                        const powRes = await QCryptoEngine.solvePoW(
-                            this.sessionData.challenge.pow.challenge,
-                            this.sessionData.challenge.pow.bits || 12
-                        );
-                        powNonce = powRes.nonce;
-                        solveMs = powRes.elapsedMs;
-                    }
-
-                    let origin = 'https://frame.103-141-140-153.sslip.io';
-                    try {
-                        const u = new URL(this.serverUrl);
-                        origin = 'https://' + u.hostname.replace(/^js\./, 'frame.') + (u.port ? ':' + u.port : '');
-                    } catch (e) {}
-
-                    const res = await sendSecureNetworkRequest({
-                        method: 'POST',
-                        url: `${origin}/v1/solve`,
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Accept': 'application/json',
-                            'Origin': origin,
-                            'Referer': `${origin}/frame.html`
-                        },
-                        data: JSON.stringify({
-                            sid: this.sessionData.sid,
-                            cid: this.sessionData.challenge.cid,
-                            answer: Array.from(this.selectedIndices),
-                            powNonce: powNonce,
-                            solveMs: solveMs
-                        })
-                    });
-
-                    if (res && res.pass && res.token) {
-                        this.renderSuccess(res.token);
-                    } else {
-                        statusBox.innerHTML = `<span style="color:#dc2626;">${res.message || 'Đáp án chưa đúng. Đang nạp câu khác...'}</span>`;
-                        setTimeout(() => this.init(), 1200);
-                    }
-                } catch (e) {
-                    statusBox.innerHTML = `<span style="color:#dc2626;">Lỗi: ${e.message}</span>`;
-                }
-            };
-        }
-
-        renderSuccess(token) {
-            this.container.innerHTML = `
-                <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;padding:16px;text-align:center;">
-                    <div style="font-size:15px;font-weight:800;color:#047857;">✓ Xác thực thành công!</div>
-                    <div style="font-size:12px;color:#065f46;margin-top:4px;">Đang nộp mã lấy thưởng...</div>
-                </div>
-            `;
-            if (typeof this.onSuccess === 'function') {
-                this.onSuccess(token);
-            }
-        }
-
-        renderError(msg) {
-            this.container.innerHTML = `
-                <div style="background:#fff;border:1px solid #fecaca;border-radius:12px;padding:16px;text-align:center;max-width:360px;margin:0 auto;">
-                    <div style="font-size:14px;font-weight:700;color:#dc2626;margin-bottom:4px;">⚠️ Không thể kết nối QCaptcha</div>
-                    <div style="font-size:12px;color:#7f1d1d;margin-bottom:12px;line-height:1.4;">
-                        ${msg}<br>Máy chủ Captcha từ chối kết nối hoặc bị chặn mạng.
-                    </div>
-                    <button type="button" id="btn-err-bypass" class="btn btn-bypass" style="width:100%;margin-bottom:8px;">
-                        ⚡ Vượt Bằng Token Dự Phòng (Khuyên Dùng)
-                    </button>
-                    <button type="button" id="btn-err-retry" class="btn" style="background:#f1f5f9;color:#475569;width:100%;">
-                        Thử kết nối lại
-                    </button>
-                </div>
-            `;
-
-            this.container.querySelector('#btn-err-bypass').onclick = () => {
-                if (typeof this.onSuccess === 'function') {
-                    this.onSuccess(BACKUP_TOKEN);
-                }
-            };
-
-            this.container.querySelector('#btn-err-retry').onclick = () => this.init();
-        }
-    }
-
-    /**
-     * Nộp mã và token hoàn tất
-     */
-    async function submitCodeVerification(token, campaignId, code, qCaptchaToken, sessionToken) {
-        console.log('[LAYMA] Đang nộp mã xác thực...');
         const payload = {
             Code: code || 'layma_auto',
             Token: token,
             CampainId: campaignId,
             UserAgent: navigator.userAgent,
             DeviceScreen: `${window.screen.width} x ${window.screen.height}`,
-            FingerprintData: JSON.stringify({
-                version: 'v1',
-                language: navigator.language || 'vi-VN',
-                platform: navigator.platform || 'Win32',
-                browser: 'Chrome',
-                browserVersion: '151.0.0.0',
-                screen: `${window.screen.width} x ${window.screen.height}`
-            }),
-            HCaptchaToken: '',
-            QCaptchaToken: qCaptchaToken || BACKUP_TOKEN,
+            FingerprintData: fingerprintData,
+            HCaptchaToken: captchaToken || '',
+            QCaptchaToken: captchaToken || '',
             CaptchaLaToken: ''
         };
 
@@ -552,47 +365,190 @@ function runVnBypassCore(window, document) {
             });
 
             const data = await res.json();
-            console.log('[LAYMA] Phản hồi nộp mã:', data);
+            console.log('[LAYMA] Kết quả /api/traffic/checkcode:', data);
 
             if (data && (data.success || data.redirectUrl || data.RedirectUrl)) {
-                const target = data.redirectUrl || data.RedirectUrl;
-                if (target) {
-                    window.location.href = target;
+                if (statusElem) {
+                    statusElem.style.color = '#059669';
+                    statusElem.innerHTML = '🎉 <b>XÁC NHẬN THÀNH CÔNG!</b> Đang chuyển tiếp...';
+                }
+                const targetUrl = data.redirectUrl || data.RedirectUrl;
+                if (targetUrl) {
+                    setTimeout(() => { window.location.href = targetUrl; }, 800);
                 } else {
-                    alert('🎉 Nộp mã thành công!');
+                    alert('Nộp mã thành công!');
                 }
             } else {
+                globalState.isSubmitting = false;
+                if (statusElem) {
+                    statusElem.style.color = '#dc2626';
+                    statusElem.innerHTML = '⚠️ Nộp mã thất bại: ' + (data.message || 'Lỗi không xác định');
+                }
                 alert('Nộp mã thất bại: ' + (data.message || JSON.stringify(data)));
             }
         } catch (err) {
+            globalState.isSubmitting = false;
             console.error('[LAYMA] Lỗi nộp mã:', err);
-            alert('Lỗi nộp mã tới máy chủ: ' + err.message);
+            if (statusElem) {
+                statusElem.style.color = '#dc2626';
+                statusElem.innerText = 'Lỗi nộp mã tới máy chủ!';
+            }
+            alert('Lỗi nộp mã tới máy chủ!');
         }
     }
 
-    /**
-     * Quy trình chính
-     */
-    async function main() {
-        injectCleanerStyles();
-
-        const wrapper = document.createElement('div');
-        wrapper.id = 'vnbypass-wrapper';
-        wrapper.innerHTML = `
-            <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:14px; padding:18px; box-shadow:0 4px 16px rgba(0,0,0,0.06); text-align:center;">
-                <div style="font-weight:800; font-size:16px; color:#1e293b; margin-bottom:4px;">🚀 LAYMA BYPASS - CUTTAY PROMAX</div>
-                <div style="font-size:12px; color:#64748b; margin-bottom:14px;">Tự động phân tích, giải mã và vượt nhiệm vụ thông minh</div>
-                <div id="vnbypass-status" style="color:#0284c7; font-weight:600; text-align:center; margin-bottom:12px;">Đang phân tích dữ liệu trang...</div>
-                <div id="vnbypass-captcha-container"></div>
-                <div style="display:flex; gap:8px; justify-content:center; margin-top:12px;">
-                    <button id="btn-force-submit" class="btn btn-bypass" style="flex:2;">⚡ Vượt Nhanh (Bỏ Qua Captcha)</button>
-                    <button id="btn-change-nv" class="btn btn-danger" style="flex:1;">Đổi Nhiệm Vụ</button>
-                </div>
+    // ------------------------------------------------------------------------
+    // 6. MODULE HIỂN THỊ CAPTCHA TRỰC TIẾP CHO NGƯỜI DÙNG GIẢI
+    // ------------------------------------------------------------------------
+    function mountCaptchaWidget(container, onSolved) {
+        container.innerHTML = `
+            <div style="font-weight:700; font-size:14px; color:#1e293b; margin-bottom:4px;">
+                🛡️ XÁC MINH BẢO MẬT
+            </div>
+            <div style="font-size:12px; color:#64748b; margin-bottom:12px;">
+                Vui lòng bấm vào ô bên dưới để hoàn tất giải Captcha:
+            </div>
+            <div id="active-captcha-box" style="min-height:78px; display:flex; justify-content:center; align-items:center;">
+                <span style="font-size:13px; color:#64748b;">Đang tải hộp Captcha...</span>
+            </div>
+            <div style="display:flex; gap:10px; width:100%; margin-top:14px; justify-content:center;">
+                <button type="button" id="btn-manual-captcha-done" class="btn btn-success" style="flex:2;">
+                    Tôi Đã Giải Xong - Nộp Mã Ngay
+                </button>
+                <button type="button" id="btn-captcha-reload" class="btn btn-warning" style="flex:1;">
+                    Tải Lại
+                </button>
             </div>
         `;
 
-        const mountTarget = document.querySelector('main#guide') || document.querySelector('.box-step-wrap') || document.body;
-        mountTarget.prepend(wrapper);
+        const statusElem = document.getElementById('vnbypass-status');
+        const siteKey = detectSiteKey();
+        console.log('[VNBYPASS] Render widget Captcha với siteKey:', siteKey);
+
+        function getSolvedToken() {
+            const win = window.unsafeWindow || window;
+            if (win.hcaptcha && globalState.hCaptchaWidgetId !== null) {
+                try {
+                    const resp = win.hcaptcha.getResponse(globalState.hCaptchaWidgetId);
+                    if (resp && resp.length > 20) return resp;
+                } catch (e) {}
+            }
+
+            const textareas = document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"], textarea[name="q-captcha-response"], input[name="q-captcha-response"]');
+            for (const ta of textareas) {
+                if (ta.value && ta.value.trim().length > 20) {
+                    return ta.value.trim();
+                }
+            }
+            return null;
+        }
+
+        const handleSuccess = (token) => {
+            if (globalState.isSubmitting) return;
+            if (globalState.captchaWatcherInterval) clearInterval(globalState.captchaWatcherInterval);
+
+            if (statusElem) {
+                statusElem.style.color = '#059669';
+                statusElem.innerHTML = '🎉 <b>Đã giải xong Captcha!</b> Đang tự động nộp mã...';
+            }
+            onSolved(token);
+        };
+
+        // Lắng nghe tự động theo chu kỳ 400ms
+        globalState.captchaWatcherInterval = setInterval(() => {
+            const token = getSolvedToken();
+            if (token && !globalState.isSubmitting) {
+                handleSuccess(token);
+            }
+        }, 400);
+
+        // Nút bấm nộp thủ công
+        document.getElementById('btn-manual-captcha-done').onclick = () => {
+            const token = getSolvedToken();
+            if (token) {
+                handleSuccess(token);
+            } else {
+                alert('Vui lòng giải xong Captcha trước khi bấm nút này!');
+            }
+        };
+
+        // Render hCaptcha widget
+        const renderHcaptcha = () => {
+            const win = window.unsafeWindow || window;
+            const target = document.getElementById('active-captcha-box');
+            if (!target) return;
+
+            try {
+                if (win.hcaptcha && typeof win.hcaptcha.render === 'function') {
+                    target.innerHTML = '';
+                    globalState.hCaptchaWidgetId = win.hcaptcha.render('active-captcha-box', {
+                        sitekey: siteKey,
+                        theme: 'light',
+                        size: 'normal',
+                        callback: (token) => handleSuccess(token),
+                        'expired-callback': () => {
+                            if (statusElem) statusElem.innerText = 'Captcha đã hết hạn, vui lòng giải lại!';
+                        },
+                        'error-callback': (err) => {
+                            console.error('[VNBYPASS] hCaptcha error callback:', err);
+                            target.innerHTML = '<span style="color:#dc2626;font-size:12px;">Lỗi tải Captcha! Vui lòng bấm nút Tải Lại.</span>';
+                        }
+                    });
+                }
+            } catch (err) {
+                console.error('[VNBYPASS] Lỗi render widget Captcha:', err);
+                target.innerHTML = `
+                    <div style="color:#dc2626;font-size:12px;">
+                        Không thể chèn widget tự động.<br>
+                        Vui lòng bấm nút Tải Lại bên dưới.
+                    </div>
+                `;
+            }
+        };
+
+        document.getElementById('btn-captcha-reload').onclick = () => {
+            const win = window.unsafeWindow || window;
+            if (win.hcaptcha && globalState.hCaptchaWidgetId !== null) {
+                try { win.hcaptcha.reset(globalState.hCaptchaWidgetId); } catch (e) { renderHcaptcha(); }
+            } else {
+                renderHcaptcha();
+            }
+        };
+
+        // Nhúng script hCaptcha nếu chưa có
+        const win = window.unsafeWindow || window;
+        if (win.hcaptcha && typeof win.hcaptcha.render === 'function') {
+            renderHcaptcha();
+        } else {
+            const script = document.createElement('script');
+            script.src = CONFIG.HCAPTCHA_SCRIPT_URL;
+            script.async = true;
+            script.defer = true;
+            script.onload = () => setTimeout(renderHcaptcha, 400);
+            document.head.appendChild(script);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. KHỞI CHẠY TỔNG HỢP VÀ ĐIỀU KHIỂN
+    // ------------------------------------------------------------------------
+    async function main() {
+        injectCleanerStyles();
+
+        // Tạo khung điều khiển VNBYPASS chèn vào đầu trang
+        const wrapper = document.createElement('div');
+        wrapper.id = 'vnbypass-wrapper';
+        wrapper.innerHTML = `
+            <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:16px; box-shadow:0 4px 12px rgba(0,0,0,0.05); text-align:center;">
+                <div style="font-weight:800; font-size:16px; color:#1e293b; margin-bottom:4px;">🚀 LAYMA BYPASS - CUTTAY PROMAX</div>
+                <div style="font-size:12px; color:#64748b; margin-bottom:12px;">Hệ thống tự động phân tích và vượt nhiệm vụ thông minh</div>
+                <div id="vnbypass-status" style="color:#0284c7; font-weight:600; text-align:center;">Đang chuẩn bị xác thực Captcha...</div>
+                <div id="vnbypass-captcha-container"></div>
+            </div>
+        `;
+
+        const guideElem = document.querySelector('main#guide') || document.querySelector('.box-step-wrap') || document.body;
+        guideElem.prepend(wrapper);
 
         const statusElem = document.getElementById('vnbypass-status');
         const captchaContainer = document.getElementById('vnbypass-captcha-container');
@@ -601,41 +557,23 @@ function runVnBypassCore(window, document) {
         const tokenId = getTokenId();
         const campaignId = getCampainId();
 
-        let sessionToken = '';
+        console.log('[VNBYPASS] Thông tin nhiệm vụ:', { trafficKey, tokenId, campaignId });
+
         if (trafficKey) {
-            sessionToken = await requestTrafficSession(trafficKey);
+            try {
+                globalState.sessionToken = await requestTrafficSession(trafficKey);
+                console.log('[VNBYPASS] Đã nhận Traffic Session Token:', globalState.sessionToken);
+            } catch (e) {
+                console.warn('[VNBYPASS] Không lấy được sessionToken:', e.message);
+            }
         }
 
-        // Bắt sự kiện nút vượt nhanh
-        document.getElementById('btn-force-submit').onclick = () => {
-            statusElem.innerText = 'Đang nộp mã trực tiếp qua token dự phòng...';
-            submitCodeVerification(tokenId, campaignId, '', BACKUP_TOKEN, sessionToken);
-        };
+        statusElem.innerHTML = '👉 <b>Vui lòng giải Captcha bên dưới để tiếp tục:</b>';
 
-        // Bắt sự kiện đổi nhiệm vụ
-        document.getElementById('btn-change-nv').onclick = () => {
-            executeChangeMission(sessionToken);
-        };
-
-        // Quét tìm thông số QCaptcha trên trang
-        const html = document.body ? document.body.innerHTML : '';
-        const siteKeyMatch = html.match(/(?:qCaptchaSiteKey|qcaptchaSiteKey)\s*[:=]\s*['"]([^'"]+)['"]/);
-        const scriptUrlMatch = html.match(/(?:qCaptchaScriptUrl|qcaptchaScriptUrl)\s*[:=]\s*['"]([^'"]+)['"]/);
-
-        if (siteKeyMatch && siteKeyMatch[1]) {
-            statusElem.innerText = 'Phát hiện yêu cầu xác thực QCaptcha. Đang kết nối...';
-            const siteKey = siteKeyMatch[1];
-            const scriptUrl = scriptUrlMatch ? scriptUrlMatch[1] : null;
-
-            const qController = new QCaptchaController(captchaContainer, siteKey, scriptUrl);
-            qController.onSuccess = (qToken) => {
-                statusElem.innerText = 'Xác minh thành công. Đang gửi dữ liệu nhận mã...';
-                submitCodeVerification(tokenId, campaignId, '', qToken, sessionToken);
-            };
-            qController.init();
-        } else {
-            statusElem.innerHTML = '<span style="color:#16a34a;font-weight:700;">✓ Nhiệm vụ đã sẵn sàng! Bấm nút bên dưới để nhận mã.</span>';
-        }
+        // Hiển thị trực tiếp widget Captcha lên màn hình
+        mountCaptchaWidget(captchaContainer, (solvedToken) => {
+            submitCodeVerification(tokenId, campaignId, '', solvedToken, globalState.sessionToken);
+        });
     }
 
     if (document.readyState === 'loading') {
